@@ -9,6 +9,20 @@ Boltz-1 is the state-of-the-art open-source model that predicts the 3D structure
 
 For more information about the model, see our [technical report](https://doi.org/10.1101/2024.11.19.624167).
 
+## Updates to run on Mac with Silicon GPU
+
+The `boltz_mac` repo has been tested on a MacBook Pro M3 Max. As expected, performance is significantly slower than e.g. on an Nvidia GPU Tesla A100. At this time, `boltz_mac` has only been tested on protein monomers and protein multimers.
+
+Using the default `boltz-1` configurations (wit MSA pre-computed), the example `multimer.yaml` (112 AAs + 116 AAs) took ~69 seconds. The added example `multimer_P27797_P01732.yaml` (417 AAs + 235 AAs) took a stunning ~59,795 seconds (~16.6 hours) when the final step `Saving structure` failed with the error message `job table full or recursion limit exceeded`. The example `multimer_O00330_P0622.yaml` (501 AAs + 509 AAs) was therefore not even started.
+As a reference, on a Tesla A100, the example `multimer.yaml` took 54s, `multimer_P27797_P01732.yaml` took 86s and `multimer_O00330_P0622.yaml` took 170s.
+The Mac M3 compared to the Nvidia A100 designed `multimer.yaml` had an RMSD of 0.352.
+
+The main change I had to make to run `boltz-1` on a Mac was to switch to CPU to compute the weighted alignment coordinates in the `weighted_rigid_align()` function in `src/boltz/model/loss/diffusion.py`. However, this slows things down dramatically.
+
+For debugging, I also included logging, which is stored in `boltz.log` and should be moved to the `out_dir` after the completion of the prediction.
+
+In order to run only the MSA, I added the `--process_inputs_only` argument to stop the prediction after input processing.
+
 ## Installation
 Install boltz with PyPI (recommended):
 

@@ -1,3 +1,5 @@
+import logging
+import shutil
 import pickle
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -399,7 +401,7 @@ def cli() -> None:
     "--cache",
     type=click.Path(exists=False),
     help="The directory where to download the data and model. Default is ~/.boltz.",
-    default="~/.boltz",
+    default="~/GitHub/boltz/database",
 )
 @click.option(
     "--checkpoint",
@@ -489,10 +491,15 @@ def cli() -> None:
     help="Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'",
     default="greedy",
 )
+@click.option(
+    "--process_inputs_only",
+    is_flag=True,
+    help="Only perform process_inputs, e.g. MSA and stop afterwards.",
+)
 def predict(
     data: str,
     out_dir: str,
-    cache: str = "~/.boltz",
+    cache: str = "~/GitHub/boltz/database",
     checkpoint: Optional[str] = None,
     devices: int = 1,
     accelerator: str = "gpu",
@@ -508,6 +515,7 @@ def predict(
     use_msa_server: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
+    process_inputs_only: bool = False,
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -535,16 +543,28 @@ def predict(
     out_dir = out_dir / f"boltz_results_{data.stem}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Configure logging to store logs in the specified directory
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        filename=out_dir/'boltz.log',
+        filemode='a'  # Append mode, use 'w' to overwrite the file
+    )
+    log = logging.getLogger(__name__)
+
     # Download necessary data and model
+    log.info("Downloading necessary data and model.")
     download(cache)
 
     # Validate inputs
+    log.info("Validating inputs.")
     data = check_inputs(data, out_dir, override)
     if not data:
-        click.echo("No predictions to run, exiting.")
+        log.info("No predictions to run, exiting.")
         return
 
     # Set up trainer
+    log.info("Setting up trainer.")
     strategy = "auto"
     if (isinstance(devices, int) and devices > 1) or (
         isinstance(devices, list) and len(devices) > 1
@@ -562,6 +582,7 @@ def predict(
     click.echo(msg)
 
     # Process inputs
+    log.info("Processing inputs")
     ccd_path = cache / "ccd.pkl"
     process_inputs(
         data=data,
@@ -572,7 +593,13 @@ def predict(
         msa_pairing_strategy=msa_pairing_strategy,
     )
 
+    # Stop if process_inputs_only flag is set
+    if process_inputs_only:
+        log.info("Process inputs only flag is set. Stopping after processing inputs.")
+        return
+    
     # Load processed data
+    log.info("Loading processed data")
     processed_dir = out_dir / "processed"
     processed = BoltzProcessedInput(
         manifest=Manifest.load(processed_dir / "manifest.json"),
@@ -581,14 +608,17 @@ def predict(
     )
 
     # Create data module
+    log.info("Setting up data module")
     data_module = BoltzInferenceDataModule(
         manifest=processed.manifest,
         target_dir=processed.targets_dir,
         msa_dir=processed.msa_dir,
         num_workers=num_workers,
+        persistent_workers=True,
     )
 
     # Load model
+    log.info("Loading model")
     if checkpoint is None:
         checkpoint = cache / "boltz1_conf.ckpt"
 
@@ -600,6 +630,7 @@ def predict(
         "write_full_pae": write_full_pae,
         "write_full_pde": write_full_pde,
     }
+    log.info("Loading model from checkpoint")
     model_module: Boltz1 = Boltz1.load_from_checkpoint(
         checkpoint,
         strict=True,
@@ -608,15 +639,18 @@ def predict(
         diffusion_process_args=asdict(BoltzDiffusionParams()),
         ema=False,
     )
+    log.info("Evaluate model")
     model_module.eval()
 
     # Create prediction writer
+    log.info("Setting up prediction writer")
     pred_writer = BoltzWriter(
         data_dir=processed.targets_dir,
         output_dir=out_dir / "predictions",
         output_format=output_format,
     )
 
+    log.info("Setting up trainer")
     trainer = Trainer(
         default_root_dir=out_dir,
         strategy=strategy,
@@ -627,12 +661,16 @@ def predict(
     )
 
     # Compute predictions
+    log.info("Computing predictions")
     trainer.predict(
         model_module,
         datamodule=data_module,
         return_predictions=False,
     )
+    log.info("Predictions computed")
 
+    # Move the log file to the out_dir
+    shutil.move('boltz.log', out_dir / 'boltz.log')
 
 if __name__ == "__main__":
     cli()

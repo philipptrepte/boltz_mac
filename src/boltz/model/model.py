@@ -1,5 +1,7 @@
 import gc
 import random
+import logging
+import time
 from typing import Any, Dict, Optional
 
 import torch
@@ -36,6 +38,9 @@ from boltz.model.modules.trunk import (
 from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', )
+log = logging.getLogger(__name__)
 
 class Boltz1(LightningModule):
     def __init__(  # noqa: PLR0915, C901, PLR0912
@@ -116,6 +121,7 @@ class Boltz1(LightningModule):
         self.rmsd = MeanMetric()
         self.best_rmsd = MeanMetric()
 
+        log.info("Initialize training logs")
         self.train_confidence_loss_logger = MeanMetric()
         self.train_confidence_loss_dict_logger = nn.ModuleDict()
         for m in [
@@ -147,6 +153,7 @@ class Boltz1(LightningModule):
         self.is_pairformer_compiled = False
 
         # Input projections
+        log.info("Input projections")
         s_input_dim = (
             token_s + 2 * const.num_tokens + 1 + len(const.pocket_contact_info)
         )
@@ -155,6 +162,7 @@ class Boltz1(LightningModule):
         self.z_init_2 = nn.Linear(s_input_dim, token_z, bias=False)
 
         # Input embeddings
+        log.info("Input embeddings")
         full_embedder_args = {
             "atom_s": atom_s,
             "atom_z": atom_z,
@@ -171,16 +179,19 @@ class Boltz1(LightningModule):
         self.token_bonds = nn.Linear(1, token_z, bias=False)
 
         # Normalization layers
+        log.info("Normalization layers")
         self.s_norm = nn.LayerNorm(token_s)
         self.z_norm = nn.LayerNorm(token_z)
 
         # Recycling projections
+        log.info("Recycling projections")
         self.s_recycle = nn.Linear(token_s, token_s, bias=False)
         self.z_recycle = nn.Linear(token_z, token_z, bias=False)
         init.gating_init_(self.s_recycle.weight)
         init.gating_init_(self.z_recycle.weight)
 
         # Pairwise stack
+        log.info("Pairwise stack")
         self.no_msa = no_msa
         if not no_msa:
             self.msa_module = MSAModule(
@@ -201,6 +212,7 @@ class Boltz1(LightningModule):
             )
 
         # Output modules
+        log.info("Output modules")
         self.structure_module = AtomDiffusion(
             score_model_args={
                 "token_z": token_z,
@@ -265,12 +277,14 @@ class Boltz1(LightningModule):
         dict_out = {}
 
         # Compute input embeddings
+        log.info("Compute input embeddings")
         with torch.set_grad_enabled(
             self.training and self.structure_prediction_training
         ):
             s_inputs = self.input_embedder(feats)
 
             # Initialize the sequence and pairwise embeddings
+            log.info("Initialize the sequence and pairwise embeddings")
             s_init = self.s_init(s_inputs)
             z_init = (
                 self.z_init_1(s_inputs)[:, :, None]
@@ -281,14 +295,17 @@ class Boltz1(LightningModule):
             z_init = z_init + self.token_bonds(feats["token_bonds"].float())
 
             # Perform rounds of the pairwise stack
+            log.info("Perform rounds of the pairwise stack")
             s = torch.zeros_like(s_init)
             z = torch.zeros_like(z_init)
 
             # Compute pairwise mask
+            log.info("Compute pairwise mask")
             mask = feats["token_pad_mask"].float()
             pair_mask = mask[:, :, None] * mask[:, None, :]
 
             for i in range(recycling_steps + 1):
+                log.info(f"Recycling step {i}")
                 with torch.set_grad_enabled(self.training and (i == recycling_steps)):
                     # Fixes an issue with unused parameters in autocast
                     if (
@@ -296,28 +313,35 @@ class Boltz1(LightningModule):
                         and (i == recycling_steps)
                         and torch.is_autocast_enabled()
                     ):
+                        log.info(f"Recycling step {i}: Clearing autocast cache")
                         torch.clear_autocast_cache()
 
                     # Apply recycling
                     s = s_init + self.s_recycle(self.s_norm(s))
                     z = z_init + self.z_recycle(self.z_norm(z))
+                    log.info(f"Recycling step {i}: Applied recycling")
 
                     # Compute pairwise stack
                     if not self.no_msa:
                         z = z + self.msa_module(z, s_inputs, feats)
+                        log.info(f"Recycling step {i}: Computed pairwise stack")
 
                     # Revert to uncompiled version for validation
                     if self.is_pairformer_compiled and not self.training:
                         pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                        log.info(f"Recycling step {i}: Reverted to uncompiled version for validation")
                     else:
                         pairformer_module = self.pairformer_module
+                        log.info(f"Recycling step {i}: Used compiled version")
 
                     s, z = pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+                    log.info(f"Recycling step {i}: Applied pairformer module")
 
             pdistogram = self.distogram_module(z)
             dict_out = {"pdistogram": pdistogram}
 
         # Compute structure module
+        log.info("Compute structure module")
         if self.training and self.structure_prediction_training:
             dict_out.update(
                 self.structure_module(
@@ -375,6 +399,7 @@ class Boltz1(LightningModule):
         symmetry_correction,
         lddt_minimization=True,
     ):
+        log.info("Get true coordinates")
         if symmetry_correction:
             min_coords_routine = (
                 minimum_lddt_symmetry_coords
@@ -426,8 +451,9 @@ class Boltz1(LightningModule):
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
         # Sample recycling steps
         recycling_steps = random.randint(0, self.training_args.recycling_steps)
-
+        log.info(f"Recycling steps: {recycling_steps}")
         # Compute the forward pass
+        log.info("Compute the forward pass")
         out = self(
             feats=batch,
             recycling_steps=recycling_steps,
@@ -437,6 +463,7 @@ class Boltz1(LightningModule):
         )
 
         # Compute losses
+        log.info("Compute losses")
         if self.structure_prediction_training:
             disto_loss, _ = distogram_loss(
                 out,
@@ -452,6 +479,7 @@ class Boltz1(LightningModule):
             disto_loss = 0.0
             diffusion_loss_dict = {"loss": 0.0, "loss_breakdown": {}}
 
+        log.info("Compute confidence loss")
         if self.confidence_prediction:
             # confidence model symmetry correction
             true_coords, _, _, true_coords_resolved_mask = self.get_true_coordinates(
@@ -476,12 +504,14 @@ class Boltz1(LightningModule):
             }
 
         # Aggregate losses
+        log.info("Aggregate losses")
         loss = (
             self.training_args.confidence_loss_weight * confidence_loss_dict["loss"]
             + self.training_args.diffusion_loss_weight * diffusion_loss_dict["loss"]
             + self.training_args.distogram_loss_weight * disto_loss
         )
         # Log losses
+        log.info("Log losses")
         self.log("train/distogram_loss", disto_loss)
         self.log("train/diffusion_loss", diffusion_loss_dict["loss"])
         for k, v in diffusion_loss_dict["loss_breakdown"].items():
@@ -580,6 +610,7 @@ class Boltz1(LightningModule):
 
     def validation_step(self, batch: dict[str, Tensor], batch_idx: int):
         # Compute the forward pass
+        log.info("Compute the forward pass")
         n_samples = self.validation_args.diffusion_samples
         try:
             out = self(
@@ -601,6 +632,7 @@ class Boltz1(LightningModule):
 
         try:
             # Compute distogram LDDT
+            log.info("Compute distogram LDDT")
             boundaries = torch.linspace(2, 22.0, 63)
             lower = torch.tensor([1.0])
             upper = torch.tensor([22.0 + 5.0])
@@ -610,6 +642,7 @@ class Boltz1(LightningModule):
             )
 
             # Compute predicted dists
+            log.info("Compute predicted dists")
             preds = out["pdistogram"]
             pred_softmax = torch.softmax(preds, dim=-1)
             pred_softmax = pred_softmax.argmax(dim=-1)
@@ -621,6 +654,7 @@ class Boltz1(LightningModule):
             true_dists = torch.cdist(true_center, true_center)
 
             # Compute lddt's
+            log.info("Compute lddt's")
             batch["token_disto_mask"] = batch["token_disto_mask"]
             disto_lddt_dict, disto_total_dict = factored_token_lddt_dist_loss(
                 feats=batch,
@@ -687,6 +721,7 @@ class Boltz1(LightningModule):
             best_complex_total_dict = all_total_dict
 
         # Filtering based on confidence
+        log.info("Filtering based on confidence")
         if self.confidence_prediction and n_samples > 1:
             # note: for now we don't have pae predictions so have to use pLDDT instead of pTM
             # also, while AF3 differentiates the best prediction per confidence type we are currently not doing it
@@ -841,6 +876,7 @@ class Boltz1(LightningModule):
         self.best_rmsd.update(best_rmsds)
 
     def on_validation_epoch_end(self):
+        log.info("Validation epoc end")
         avg_lddt = {}
         avg_disto_lddt = {}
         avg_complex_lddt = {}
@@ -1114,6 +1150,7 @@ class Boltz1(LightningModule):
         self.best_rmsd.reset()
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Any:
+        log.info("Predict step")
         try:
             out = self(
                 batch,
@@ -1159,6 +1196,7 @@ class Boltz1(LightningModule):
                 raise {"exception": True}
 
     def configure_optimizers(self):
+        log.info("Configure optimizers")
         """Configure the optimizer."""
 
         if self.structure_prediction_training:
@@ -1189,16 +1227,19 @@ class Boltz1(LightningModule):
         return optimizer
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        log.info("Save checkpoint")
         if self.use_ema:
             checkpoint["ema"] = self.ema.state_dict()
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        log.info("Load checkpoint")
         if self.use_ema and self.ema is None:
             self.ema = ExponentialMovingAverage(
                 parameters=self.parameters(), decay=self.ema_decay
             )
 
     def on_train_start(self):
+        log.info("Train start")
         if self.use_ema and self.ema is None:
             self.ema = ExponentialMovingAverage(
                 parameters=self.parameters(), decay=self.ema_decay
@@ -1207,15 +1248,19 @@ class Boltz1(LightningModule):
             self.ema.to(self.device)
 
     def on_train_epoch_start(self) -> None:
+        log.info("Train epoch start")
         if self.use_ema:
             self.ema.restore(self.parameters())
 
     def on_train_batch_end(self, outputs, batch: Any, batch_idx: int) -> None:
+        log.info("Train batch end")
         # Updates EMA parameters after optimizer.step()
         if self.use_ema:
             self.ema.update(self.parameters())
 
     def prepare_eval(self) -> None:
+        log.info("Prepare Exponential Moving Average...")
+
         if self.use_ema and self.ema is None:
             self.ema = ExponentialMovingAverage(
                 parameters=self.parameters(), decay=self.ema_decay

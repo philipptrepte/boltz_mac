@@ -1,5 +1,6 @@
 from dataclasses import asdict, replace
 import json
+import logging
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +18,9 @@ from boltz.data.types import (
 from boltz.data.write.mmcif import to_mmcif
 from boltz.data.write.pdb import to_pdb
 
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', )
+log = logging.getLogger(__name__)
 
 class BoltzWriter(BasePredictionWriter):
     """Custom writer for predictions."""
@@ -36,6 +40,7 @@ class BoltzWriter(BasePredictionWriter):
 
         """
         super().__init__(write_interval="batch")
+        log.info("Initializing BoltzWriter")
         if output_format not in ["pdb", "mmcif"]:
             msg = f"Invalid output format: {output_format}"
             raise ValueError(msg)
@@ -59,55 +64,67 @@ class BoltzWriter(BasePredictionWriter):
         dataloader_idx: int,  # noqa: ARG002
     ) -> None:
         """Write the predictions to disk."""
+        log.info(f"Writing batch {batch_idx} and dataload {dataloader_idx} to disk") 
         if prediction["exception"]:
             self.failed += 1
             return
 
         # Get the records
+        log.info("Getting records")
         records: list[Record] = batch["record"]
 
         # Get the predictions
+        log.info("Getting predictions") 
         coords = prediction["coords"]
         coords = coords.unsqueeze(0)
 
         pad_masks = prediction["masks"]
 
         # Get ranking
+        log.info("Getting ranking")
         argsort = torch.argsort(prediction["confidence_score"], descending=True)
         idx_to_rank = {idx.item(): rank for rank, idx in enumerate(argsort)}
 
         # Iterate over the records
+        log.info("Iterating over records") 
         for record, coord, pad_mask in zip(records, coords, pad_masks):
             # Load the structure
+            log.info(f"Loading structure {record.id}") 
             path = self.data_dir / f"{record.id}.npz"
             structure: Structure = Structure.load(path)
 
             # Compute chain map with masked removed, to be used later
+            log.info("Computing chain map")
             chain_map = {}
             for i, mask in enumerate(structure.mask):
                 if mask:
                     chain_map[len(chain_map)] = i
 
             # Remove masked chains completely
+            log.info("Removing masked chains")
             structure = structure.remove_invalid_chains()
 
             for model_idx in range(coord.shape[0]):
                 # Get model coord
+                log.info(f"Getting model coord {model_idx}")
                 model_coord = coord[model_idx]
                 # Unpad
                 coord_unpad = model_coord[pad_mask.bool()]
                 coord_unpad = coord_unpad.cpu().numpy()
 
                 # New atom table
+                log.info("Updating atoms")
                 atoms = structure.atoms
                 atoms["coords"] = coord_unpad
                 atoms["is_present"] = True
 
                 # Mew residue table
+                log.info("Updating residues")
                 residues = structure.residues
                 residues["is_present"] = True
 
                 # Update the structure
+                log.info("Updating structure")
                 interfaces = np.array([], dtype=Interface)
                 new_structure: Structure = replace(
                     structure,
@@ -117,6 +134,7 @@ class BoltzWriter(BasePredictionWriter):
                 )
 
                 # Update chain info
+                log.info("Updating chain info")
                 chain_info = []
                 for chain in new_structure.chains:
                     old_chain_idx = chain_map[chain["asym_id"]]
@@ -129,6 +147,7 @@ class BoltzWriter(BasePredictionWriter):
                     chain_info.append(new_chain_info)
 
                 # Save the structure
+                log.info(f"Saving structure {record.id}")
                 struct_dir = self.output_dir / record.id
                 struct_dir.mkdir(exist_ok=True)
 
@@ -156,6 +175,7 @@ class BoltzWriter(BasePredictionWriter):
                     np.savez_compressed(path, **asdict(new_structure))
 
                 # Save confidence summary
+                log.info("Saving confidence summary")
                 if "plddt" in prediction:
                     path = (
                         struct_dir
@@ -204,6 +224,7 @@ class BoltzWriter(BasePredictionWriter):
                     np.savez_compressed(path, plddt=plddt.cpu().numpy())
 
                 # Save pae
+                log.info("Saving pae")
                 if "pae" in prediction:
                     pae = prediction["pae"][model_idx]
                     path = (
@@ -213,6 +234,7 @@ class BoltzWriter(BasePredictionWriter):
                     np.savez_compressed(path, pae=pae.cpu().numpy())
 
                 # Save pde
+                log.info("Saving pde")
                 if "pde" in prediction:
                     pde = prediction["pde"][model_idx]
                     path = (

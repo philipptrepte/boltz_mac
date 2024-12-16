@@ -1,3 +1,8 @@
+# Ignore
+.DS_Store
+database/
+examples/.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -3,7 +3,11 @@
 from einops import einsum
 import torch
 import torch.nn.functional as F
+import logging
 
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', )
+log = logging.getLogger(__name__)
 
 def weighted_rigid_align(
     true_coords,
@@ -35,6 +39,7 @@ def weighted_rigid_align(
     weights = (mask * weights).unsqueeze(-1)
 
     # Compute weighted centroids
+    log.info("Computing weighted centroids")
     true_centroid = (true_coords * weights).sum(dim=1, keepdim=True) / weights.sum(
         dim=1, keepdim=True
     )
@@ -43,6 +48,7 @@ def weighted_rigid_align(
     )
 
     # Center the coordinates
+    log.info("Centering the coordinates")
     true_coords_centered = true_coords - true_centroid
     pred_coords_centered = pred_coords - pred_centroid
 
@@ -53,19 +59,22 @@ def weighted_rigid_align(
         )
 
     # Compute the weighted covariance matrix
+    log.info("Computing the weighted covariance matrix")
     cov_matrix = einsum(
         weights * pred_coords_centered, true_coords_centered, "b n i, b n j -> b i j"
     )
 
     # Compute the SVD of the covariance matrix, required float32 for svd and determinant
+    log.info("Computing the SVD of the covariance matrix")
     original_dtype = cov_matrix.dtype
     cov_matrix_32 = cov_matrix.to(dtype=torch.float32)
     U, S, V = torch.linalg.svd(
-        cov_matrix_32, driver="gesvd" if cov_matrix_32.is_cuda else None
-    )
+        cov_matrix_32 if cov_matrix_32.is_cuda else cov_matrix_32.to("cpu"), driver="gesvd" if cov_matrix_32.is_cuda else None
+        )
     V = V.mH
 
     # Catch ambiguous rotation by checking the magnitude of singular values
+    log.info("Checking the magnitude of singular values")
     if (S.abs() <= 1e-15).any() and not (num_points < (dim + 1)):
         print(
             "Warning: Excessively low rank of "
@@ -74,17 +83,23 @@ def weighted_rigid_align(
         )
 
     # Compute the rotation matrix
+    log.info("Computing the rotation matrix")
     rot_matrix = torch.einsum("b i j, b k j -> b i k", U, V).to(dtype=torch.float32)
 
     # Ensure proper rotation matrix with determinant 1
+    log.info("Ensuring proper rotation matrix with determinant 1")
     F = torch.eye(dim, dtype=cov_matrix_32.dtype, device=cov_matrix.device)[
         None
     ].repeat(batch_size, 1, 1)
     F[:, -1, -1] = torch.det(rot_matrix)
+    F = F if cov_matrix_32.is_cuda else F.to("cpu")
     rot_matrix = einsum(U, F, V, "b i j, b j k, b l k -> b i l")
     rot_matrix = rot_matrix.to(dtype=original_dtype)
 
     # Apply the rotation and translation
+    log.info("Applying the rotation and translation")
+    true_coords_centered = true_coords_centered if cov_matrix_32.is_cuda else true_coords_centered.to("cpu")
+    pred_centroid = pred_centroid if cov_matrix_32.is_cuda else pred_centroid.to("cpu")
     aligned_coords = (
         einsum(true_coords_centered, rot_matrix, "b n i, b j i -> b n j")
         + pred_centroid
@@ -127,6 +142,7 @@ def smooth_lddt_loss(
         Aligned coordinates
 
     """
+    log.info("Compute weighted alignment.")
     B, N, _ = true_coords.shape
     true_dists = torch.cdist(true_coords, true_coords)
     is_nucleotide = is_nucleotide.repeat_interleave(multiplicity, 0)
@@ -144,10 +160,12 @@ def smooth_lddt_loss(
     mask = mask * (coords_mask.unsqueeze(-1) * coords_mask.unsqueeze(-2))
 
     # Compute distances between all pairs of atoms
+    log.info("Compute distances between all pairs of atoms.")
     pred_dists = torch.cdist(pred_coords, pred_coords)
     dist_diff = torch.abs(true_dists - pred_dists)
 
     # Compute epsilon values
+    log.info("Compute epsilon values.")
     eps = (
         (
             (
@@ -163,6 +181,7 @@ def smooth_lddt_loss(
     )
 
     # Calculate masked averaging
+    log.info("Calculate masked averaging.")
     eps = eps.repeat_interleave(multiplicity, 0)
     num = (eps * mask).sum(dim=(-1, -2))
     den = mask.sum(dim=(-1, -2)).clamp(min=1)
