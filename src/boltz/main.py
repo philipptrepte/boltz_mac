@@ -613,8 +613,7 @@ def predict(
         manifest=processed.manifest,
         target_dir=processed.targets_dir,
         msa_dir=processed.msa_dir,
-        num_workers=num_workers,
-        persistent_workers=True,
+        num_workers=num_workers
     )
 
     # Load model
